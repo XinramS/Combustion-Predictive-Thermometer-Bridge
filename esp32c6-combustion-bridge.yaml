@@ -1,0 +1,202 @@
+esphome:
+  name: esp32c6-combustion-bridge
+  friendly_name: "Combustion Bridge"
+
+esp32:
+  board: esp32-c6-devkitm-1
+  framework:
+    type: esp-idf
+
+# --- NETWORK CONFIGURATION ---
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+  power_save_mode: NONE
+
+mqtt:
+  broker: "YOUR_MQTT_BROKER_IP"
+  username: "YOUR_MQTT_USERNAME"
+  password: "YOUR_MQTT_PASSWORD"
+  discovery: true
+  discovery_prefix: homeassistant
+
+logger:
+  level: INFO
+
+# --- BLE SCANNER & LOGIC ENGINE ---
+esp32_ble_tracker:
+  scan_parameters:
+    duration: 5s
+    interval: 40ms
+    window: 30ms
+    active: false
+  on_ble_advertise:
+    - mac_address: "YOUR_PROBE_MAC_ADDRESS"  # e.g. c2:71:0c:e2:72:00
+      then:
+        - lambda: |-
+            for (auto &data : x.get_manufacturer_datas()) {
+              if (data.uuid.to_string() == "0x09C7" && data.data.size() >= 20) {
+
+                // --- FILTER: skip heartbeat/status packets that have no temp data ---
+                // Real temp packets have non-zero data beyond byte 7.
+                // Heartbeat packets look like: XX 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 C0
+                bool has_temp_data = false;
+                for (int i = 7; i <= 17; i++) {
+                  if (data.data[i] != 0x00) { has_temp_data = true; break; }
+                }
+                if (!has_temp_data) return;
+
+                // --- 13-BIT STREAM PARSING ---
+                // Build a byte array for clean bit access
+                uint8_t b[13];
+                for (int i = 0; i < 13; i++) b[i] = data.data[5 + i];
+
+                uint16_t raw_t[8];
+                // Extract each 13-bit value by computing its start bit and reading across bytes
+                for (int s = 0; s < 8; s++) {
+                  int start_bit = s * 13;
+                  int byte_idx  = start_bit / 8;
+                  int bit_off   = start_bit % 8;
+
+                  // Read 3 bytes to safely span any 13-bit window
+                  uint32_t window = (uint32_t)b[byte_idx];
+                  if (byte_idx + 1 < 13) window |= ((uint32_t)b[byte_idx + 1] << 8);
+                  if (byte_idx + 2 < 13) window |= ((uint32_t)b[byte_idx + 2] << 16);
+
+                  raw_t[s] = (window >> bit_off) & 0x1FFF;
+                }
+
+                // --- TEMPERATURE SCALING: (raw * 0.05) - 20.0 °C ---
+                float t[8];
+                for (int i = 0; i < 8; i++) t[i] = (raw_t[i] * 0.05f) - 20.0f;
+
+                id(sensor_t1).publish_state(t[0]);
+                id(sensor_t2).publish_state(t[1]);
+                id(sensor_t3).publish_state(t[2]);
+                id(sensor_t4).publish_state(t[3]);
+                id(sensor_t5).publish_state(t[4]);
+                id(sensor_t6).publish_state(t[5]);
+                id(sensor_t7).publish_state(t[6]);
+                id(sensor_t8).publish_state(t[7]);
+
+                // --- BATTERY STATUS & VIRTUAL SENSORS (byte 19) ---
+                // Bit 0:   Battery status (0 = OK, 1 = Low)
+                // Bits 1–3: Virtual Core   (3-bit, maps 0→T1 … 5→T6)
+                // Bits 4–5: Virtual Surface (2-bit, maps 0→T4 … 3→T7)
+                // Bits 6–7: Virtual Ambient (2-bit, maps 0→T5 … 3→T8)
+                uint8_t status_byte = data.data[19];
+
+                bool battery_low = (status_byte & 0x01);
+                id(probe_battery_low).publish_state(battery_low ? "Low" : "Normal");
+
+                uint8_t virt        = (status_byte >> 1) & 0x7F;
+                uint8_t core_idx    =  virt        & 0x07;
+                uint8_t surface_idx = (virt >> 3)  & 0x03;
+                uint8_t ambient_idx = (virt >> 5)  & 0x03;
+
+                if (core_idx < 6)
+                  id(v_core_temp).publish_state(t[core_idx]);
+                if (surface_idx < 4)
+                  id(v_surface_temp).publish_state(t[surface_idx + 3]);
+                if (ambient_idx < 4)
+                  id(v_ambient_temp).publish_state(t[ambient_idx + 4]);
+              }
+            }
+
+# --- SENSORS ---
+sensor:
+  # Virtual (physics-calculated) temperatures
+  - platform: template
+    name: "Combustion Dynamic Core"
+    id: v_core_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "Combustion Dynamic Surface"
+    id: v_surface_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 2
+
+  - platform: template
+    name: "Combustion Dynamic Ambient"
+    id: v_ambient_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 2
+
+  # Individual thermistor readings (T1–T8)
+  - platform: template
+    name: "Combustion Sensor T1 (Tip)"
+    id: sensor_t1
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T2"
+    id: sensor_t2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T3"
+    id: sensor_t3
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T4"
+    id: sensor_t4
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T5"
+    id: sensor_t5
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T6"
+    id: sensor_t6
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T7"
+    id: sensor_t7
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Combustion Sensor T8 (Handle)"
+    id: sensor_t8
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+text_sensor:
+  - platform: template
+    name: "Combustion Battery State"
+    id: probe_battery_low
+    icon: "mdi:battery"
